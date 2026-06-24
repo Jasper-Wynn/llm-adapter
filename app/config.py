@@ -16,7 +16,7 @@ class Config(BaseSettings):
     # Server
     # =========================
     PORT: int = 18002
-    SERVER_API_KEY: str = "sk-w3-adapter"
+    SERVER_API_KEY: str = "sk-llm-adapter"
     REQUEST_TIMEOUT: int = 120000
     BODY_LIMIT: str = "20mb"
 

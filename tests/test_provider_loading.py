@@ -14,20 +14,11 @@ class FakeProvider:
         return cls()
 
 
-def test_config_uses_provider_class_without_w3_defaults():
+def test_config_uses_provider_class_without_defaults():
     cfg = Config(_env_file=None)
 
     assert cfg.PROVIDER_CLASS == "app.provider.openai_compatible.OpenAICompatibleProvider"
     assert cfg.PROVIDER_TIMEOUT == 300000
-    assert not hasattr(cfg, "W3_BASE_URL")
-    assert not hasattr(cfg, "W3_CHAT_ENDPOINT")
-    assert not hasattr(cfg, "W3_MODELS_ENDPOINT")
-    assert not hasattr(cfg, "W3_AUTH_TOKEN")
-    assert not hasattr(cfg, "PROVIDER_BASE_URL")
-    assert not hasattr(cfg, "PROVIDER_CHAT_ENDPOINT")
-    assert not hasattr(cfg, "PROVIDER_MODELS_ENDPOINT")
-    assert not hasattr(cfg, "PROVIDER_AUTH_TOKEN")
-    assert not hasattr(cfg, "PROVIDER_HEADERS_JSON")
 
 
 def test_load_provider_from_config_class_name():

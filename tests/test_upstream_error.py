@@ -3,7 +3,7 @@ from __future__ import annotations
 from app.protocol.upstream_error import UpstreamErrorCodec
 
 
-def test_w3_quota_error_normalized():
+def test_quota_error_normalized():
     payload = {
         "text": "[DONE]",
         "error": {
