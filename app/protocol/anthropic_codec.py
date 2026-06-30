@@ -42,9 +42,12 @@ class AnthropicCodec:
             out["messages"].extend(_system(req["system"]))
 
         for msg in req.get("messages", []):
-            if msg.get("role") == "user":
+            role = msg.get("role")
+            if role == "system":
+                out["messages"].extend(_system(msg.get("content", "")))
+            elif role == "user":
                 out["messages"].extend(_user(msg))
-            elif msg.get("role") == "assistant":
+            elif role == "assistant":
                 out["messages"].append(_assistant(msg))
 
         if req.get("tools"):
@@ -64,7 +67,7 @@ class AnthropicCodec:
         return out
 
     @staticmethod
-    def response_from_openai(resp: dict[str, Any], *, model: str, thinking: bool) -> dict[str, Any]:
+    def response_from_openai(resp: dict[str, Any], *, model: str, thinking: bool = False) -> dict[str, Any]:
         choice = (resp.get("choices") or [{}])[0] or {}
         msg = choice.get("message") or {}
 

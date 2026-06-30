@@ -1,163 +1,149 @@
 """FastAPI application entry point."""
-
 from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
 from typing import Any
 
+import uvicorn
 from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 
+from app import config as cfg
 from app.adapters.anthropic import AnthropicAdapter
 from app.adapters.openai import OpenAIAdapter
-from app.config import get_config
 from app.gateway.middleware import BodyLimitMiddleware
 from app.gateway.router import router
+from app.gateway.session_cancel import StreamCancellationRegistry
 from app.log import configure_logging, logger
 from app.provider.loader import load_provider
 from app.tools.http import parse_size
 
 
-APP_TITLE = "Anthropic/OpenAI Format Adapter"
-APP_VERSION = "3.4.1"
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    cfg = get_config()
-
-    configure_logging(level=cfg.LOG_LEVEL, external_level=cfg.LOG_EXTERNAL_LEVEL, console=cfg.LOG_CONSOLE, file_enabled=cfg.LOG_FILE, file_path=cfg.LOG_FILE_PATH)
-
+    configure_logging(
+        level=cfg.LOG_LEVEL,
+        external_level=cfg.LOG_EXTERNAL_LEVEL,
+        console=cfg.LOG_CONSOLE,
+        file_enabled=cfg.LOG_FILE,
+        file_path=cfg.LOG_FILE_PATH,
+    )
     log = logger("app")
-
-    provider = load_provider(cfg, logger=logger("provider"))
-
+    provider = load_provider(logger=logger("provider"))
+    stream_registry = StreamCancellationRegistry(logger=logger("gateway.session_cancel"))
     app.state.provider = provider
-    app.state.openai_adapter = OpenAIAdapter(provider=provider, logger=logger("adapter.openai"))
-    app.state.anthropic_adapter = AnthropicAdapter(provider=provider, drop_thinking_block=cfg.DROP_THINKING_BLOCK, throttle_text_delta_ms=cfg.DEBUG_THROTTLE_TEXT_DELTA_MS, logger=logger("adapter.anthropic"))
+    app.state.stream_registry = stream_registry
+    app.state.openai_adapter = OpenAIAdapter(provider=provider, stream_registry=stream_registry, logger=logger("adapter.openai"))
+    app.state.anthropic_adapter = AnthropicAdapter(
+        provider=provider,
+        drop_thinking_block=cfg.DROP_THINKING_BLOCK,
+        throttle_text_delta_ms=cfg.DEBUG_THROTTLE_TEXT_DELTA_MS,
+        stream_registry=stream_registry,
+        logger=logger("adapter.anthropic"),
+    )
     app.state.is_shutting_down = False
 
-    _print_startup_banner(cfg)
-    print(f"  Provider: {cfg.PROVIDER_CLASS}")
-    print("=" * 60)
-
+    _log_startup(log, provider)
     try:
-        _print_models(await provider.get_models(check_permission=True))
+        models = await provider.get_models(check_permission=True)
+        _log_models(log, models)
     except Exception as exc:
-        log.warning("Models fetch failed: %s", exc)
+        log.warning("[startup] models fetch failed: %s", exc)
 
     try:
         yield
-
     finally:
         app.state.is_shutting_down = True
-
         try:
             await asyncio.wait_for(provider.aclose(), timeout=3.0)
-            log.info("Provider closed.")
+            log.info("[shutdown] provider closed")
         except asyncio.TimeoutError:
-            log.warning("Provider close timeout.")
+            log.warning("[shutdown] provider close timeout")
         except Exception as exc:
-            log.warning("Provider close failed: %s", exc)
-
-        log.info("Server shutdown complete.")
+            log.warning("[shutdown] provider close failed: %s", exc)
+        log.info("[shutdown] server shutdown complete")
 
 
 def create_app() -> FastAPI:
-    cfg = get_config()
-
-    app = FastAPI(title=APP_TITLE, version=APP_VERSION, lifespan=lifespan)
-
-    _install_middlewares(app, cfg)
+    app = FastAPI(title=cfg.APP_TITLE, version=cfg.APP_VERSION, lifespan=lifespan)
+    _install_middlewares(app)
     _install_root_routes(app)
     app.include_router(router)
-
     return app
 
 
-def _install_middlewares(app: FastAPI, cfg) -> None:
+def _install_middlewares(app: FastAPI) -> None:
     app.add_middleware(BodyLimitMiddleware, max_bytes=parse_size(cfg.BODY_LIMIT))
-
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["GET", "POST", "OPTIONS", "HEAD"],
-        allow_headers=[
-            "Accept",
-            "Content-Type",
-            "Authorization",
-            "X-Auth-Token",
-            "x-api-key",
-            "x-request-id",
-            "anthropic-version",
-            "anthropic-beta",
-        ],
-        expose_headers=[
-            "Content-Type",
-            "Cache-Control",
-            "X-Accel-Buffering",
-            "X-Request-ID",
-        ],
+        allow_origins=cfg.CORS_ALLOW_ORIGINS,
+        allow_methods=cfg.CORS_ALLOW_METHODS,
+        allow_headers=cfg.CORS_ALLOW_HEADERS,
+        expose_headers=cfg.CORS_EXPOSE_HEADERS,
     )
 
 
 def _install_root_routes(app: FastAPI) -> None:
-    @app.get("/")
+    @app.get(cfg.ROOT_ROUTE)
     async def root():
         return {
-            "service": APP_TITLE,
-            "version": APP_VERSION,
+            "service": cfg.APP_TITLE,
+            "version": cfg.APP_VERSION,
             "status": "running",
             "endpoints": {
-                "anthropic": "POST /v1/messages",
-                "openai": "POST /v1/chat/completions",
-                "models": "GET /v1/models",
-                "health": "GET /health",
+                "anthropic": f"POST {cfg.ANTHROPIC_MESSAGES_ROUTE}",
+                "openai": f"POST {cfg.OPENAI_CHAT_COMPLETIONS_ROUTE}",
+                "models": f"GET {cfg.OPENAI_MODELS_ROUTE}",
+                "upstream_models": f"GET {cfg.COMPAT_MODELS_ROUTE}",
+                "health": f"GET {cfg.HEALTH_ROUTE}",
             },
         }
 
-    @app.head("/")
+    @app.head(cfg.ROOT_ROUTE)
     async def root_head():
         return Response(status_code=200)
 
 
-def _print_startup_banner(cfg) -> None:
-    print("=" * 60)
-    print(f"  {APP_TITLE} Server")
-    print("=" * 60)
-    print(f"  Server: http://{cfg.UVICORN_HOST}:{cfg.PORT}")
-    print(f"  Body Limit: {cfg.BODY_LIMIT}")
-    print(f"  Debug Stream: {cfg.DEBUG_STREAM}")
-    print(f"  Drop Thinking Block: {cfg.DROP_THINKING_BLOCK}")
-    print(f"  Text Delta Throttle: {cfg.DEBUG_THROTTLE_TEXT_DELTA_MS}ms")
-    print("=" * 60)
+def _log_startup(log, provider) -> None:
+    description = provider.describe()
+    log.info("[startup] app=%s version=%s", cfg.APP_TITLE, cfg.APP_VERSION)
+    log.info("[startup] server=http://%s:%s body_limit=%s", cfg.HOST, cfg.PORT, cfg.BODY_LIMIT)
+    log.info(
+        "[startup] provider=%s base_url=%s chat=%s models=%s verify_ssl=%s trust_env=%s http2=%s headers=%s",
+        description.get("provider"),
+        description.get("base_url"),
+        description.get("chat_endpoint"),
+        description.get("models_endpoint"),
+        description.get("verify_ssl"),
+        description.get("trust_env"),
+        description.get("http2"),
+        description.get("provider_header_names"),
+    )
+    log.info("[startup] debug_stream=%s drop_thinking_block=%s throttle_ms=%s", cfg.DEBUG_STREAM, cfg.DROP_THINKING_BLOCK, cfg.DEBUG_THROTTLE_TEXT_DELTA_MS)
+    log.debug_json("[startup] provider", description)
+    log.debug_json("[startup] runtime_config", cfg.as_dict())
 
 
-def _print_models(models: list[dict[str, Any]]) -> None:
-    print(f"\n  Models ({len(models)})")
-    print("  " + "-" * 60)
-
-    for model in models[:20]:
-        model_id = str(model.get("modelId") or model.get("id") or "")[:18].ljust(18)
-        name = str(model.get("name") or "")[:19].ljust(19)
-        context = str(model.get("context") or 0).rjust(8)
-        input_tokens = str(model.get("input") or 0).rjust(8)
-        output_tokens = str(model.get("output") or 0).rjust(8)
-        print(f"  {model_id} {name} {context} {input_tokens} {output_tokens}")
-
-    print("  " + "-" * 60)
+def _log_models(log, models: list[dict[str, Any]]) -> None:
+    model_ids = [str(model.get("id") or model.get("modelId") or model.get("name") or "") for model in models[:20]]
+    log.info("[startup] models count=%s sample=%s", len(models), model_ids)
 
 
 app = create_app()
 
 
 def main() -> None:
-    import uvicorn
-
-    cfg = get_config()
-
-    uvicorn.run("app.main:app", host=cfg.UVICORN_HOST, port=cfg.PORT, log_level=cfg.LOG_LEVEL.lower(), access_log=cfg.UVICORN_ACCESS_LOG, timeout_keep_alive=cfg.UVICORN_TIMEOUT_KEEP_ALIVE, timeout_graceful_shutdown=cfg.UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN, reload=cfg.UVICORN_RELOAD)
+    uvicorn.run(
+        cfg.UVICORN_APP,
+        host=cfg.HOST,
+        port=cfg.PORT,
+        log_level=cfg.LOG_LEVEL.lower(),
+        access_log=cfg.UVICORN_ACCESS_LOG,
+        timeout_keep_alive=cfg.UVICORN_TIMEOUT_KEEP_ALIVE,
+        timeout_graceful_shutdown=cfg.UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN,
+        reload=cfg.UVICORN_RELOAD,
+    )
 
 
 if __name__ == "__main__":

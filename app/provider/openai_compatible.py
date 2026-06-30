@@ -1,103 +1,283 @@
-"""Configurable OpenAI-compatible upstream provider."""
-
+"""OpenAI-compatible upstream provider."""
 from __future__ import annotations
 
-import logging
-from typing import Any, AsyncIterator
+import asyncio
+import time
+from typing import Any, AsyncIterator, Mapping
+from urllib.parse import urljoin
 
-import httpx
-
-from app.models.sse import SSEChunk
+from app import config as cfg
+from app.models.sse import SSEEvent
 from app.provider.base import BaseProvider
-from app.protocol.sse import SSE
-from app.tools.http import safe_headers
+from app.protocol.sse import DONE
 
 
 class OpenAICompatibleProvider(BaseProvider):
-    def __init__(self, *, base_url: str, chat_endpoint: str, models_endpoint: str, timeout: int, verify_ssl: bool, debug_stream: bool, models_query: dict[str, Any], stream_options: dict[str, Any] | None, logger: logging.Logger | None = None):
-        if not base_url:
-            raise RuntimeError("BASE_URL must be configured on the provider class.")
+    def __init__(self, *, logger=None):
+        super().__init__(logger=logger)
+        self.client = self.build_http_client()
+        self.stream_client = self.build_http_client()
 
-        self.base_url = base_url.rstrip("/")
-        self.chat_endpoint = chat_endpoint
-        self.models_endpoint = models_endpoint
-        self.models_query = models_query
-        self.stream_options = stream_options
-        self.debug_stream = debug_stream
-        self.log = logger or logging.getLogger(__name__)
+    async def create_completion(
+        self,
+        payload: dict[str, Any],
+        *,
+        request_id: str | None = None,
+        client_headers: Mapping[str, str] | None = None,
+    ) -> dict[str, Any]:
+        url = self._url(self.CHAT_ENDPOINT)
+        body = self.transform_payload(payload)
+        headers = self.headers(request_id=request_id, client_headers=client_headers)
+        started = time.perf_counter()
+        self._log_upstream_request(request_id, "POST", url, body, headers)
+        response = await self.client.post(url, json=body, headers=headers)
+        elapsed = (time.perf_counter() - started) * 1000
+        self.log.info("[%s] upstream response status=%s elapsed=%.1fms", request_id, response.status_code, elapsed)
+        if response.status_code >= 400:
+            self.log.warning("[%s] upstream error status=%s body=%s", request_id, response.status_code, response.text[:1000])
+            response.raise_for_status()
+        return response.json()
 
-        timeout_seconds = timeout / 1000 if timeout > 1000 else timeout
-        timeout_config = httpx.Timeout(connect=30, read=timeout_seconds, write=30, pool=30)
+    async def stream_sse(
+        self,
+        payload: dict[str, Any],
+        *,
+        request_id: str | None = None,
+        client_headers: Mapping[str, str] | None = None,
+    ) -> AsyncIterator[SSEEvent]:
+        url = self._url(self.CHAT_ENDPOINT)
+        body = self.transform_payload({**payload, "stream": True})
+        headers = self.headers(request_id=request_id, stream=True, client_headers=client_headers)
+        started = time.perf_counter()
+        first_chunk = False
+        chunks = 0
+        close_reason = "unknown"
+        response_status: int | None = None
 
-        client_options = {"http2": True, "verify": verify_ssl, "timeout": timeout_config, "trust_env": False}
-        self.client = httpx.AsyncClient(**client_options)
-        self.stream_client = httpx.AsyncClient(**client_options)
+        self._log_upstream_request(request_id, "POST", url, body, headers, stream=True)
+        try:
+            async with self.stream_client.stream("POST", url, json=body, headers=headers) as response:
+                response_status = response.status_code
+                elapsed = (time.perf_counter() - started) * 1000
+                self.log.info("[%s] upstream.stream.start status=%s elapsed=%.1fms", request_id, response.status_code, elapsed)
+                if response.status_code >= 400:
+                    close_reason = "upstream_error"
+                    text = await response.aread()
+                    preview = text.decode("utf-8", errors="replace")[:1000]
+                    self.log.warning("[%s] upstream stream error status=%s body=%s", request_id, response.status_code, preview)
+                    yield SSEEvent(data=preview, status_code=response.status_code)
+                    return
 
-    @classmethod
-    def from_config(cls, cfg, *, logger: logging.Logger | None = None):
-        timeout = getattr(cfg, "PROVIDER_TIMEOUT", cls.TIMEOUT)
-        debug_stream = getattr(cfg, "DEBUG_STREAM", cls.DEBUG_STREAM)
-        return cls(base_url=cls.BASE_URL, chat_endpoint=cls.CHAT_ENDPOINT, models_endpoint=cls.MODELS_ENDPOINT, timeout=timeout, verify_ssl=cls.VERIFY_SSL, debug_stream=debug_stream, models_query=cls.MODELS_QUERY, stream_options=cls.STREAM_OPTIONS, logger=logger)
+                event_name: str | None = None
+                data_lines: list[str] = []
+
+                async for line in response.aiter_lines():
+                    if line == DONE:
+                        close_reason = "completed"
+                    if not first_chunk:
+                        first_chunk = True
+                        self.log.info(
+                            "[%s] upstream.stream.first_chunk elapsed=%.1fms",
+                            request_id,
+                            (time.perf_counter() - started) * 1000,
+                        )
+                    if line == "":
+                        if data_lines or event_name:
+                            data = "\n".join(data_lines)
+                            if data == DONE:
+                                close_reason = "completed"
+                            chunks += 1
+                            yield SSEEvent(data=data, event=event_name, status_code=response.status_code)
+                        event_name = None
+                        data_lines = []
+                        continue
+                    if line.startswith(":"):
+                        continue
+                    if line.startswith("event:"):
+                        event_name = line[6:].strip()
+                        continue
+                    if line.startswith("data:"):
+                        data_lines.append(line[5:].lstrip())
+                        continue
+                    # Some gateways emit raw JSONL instead of SSE.
+                    if line == DONE or line.startswith("{"):
+                        if line == DONE:
+                            close_reason = "completed"
+                        chunks += 1
+                        yield SSEEvent(data=line, status_code=response.status_code)
+
+                if data_lines or event_name:
+                    data = "\n".join(data_lines)
+                    if data == DONE:
+                        close_reason = "completed"
+                    chunks += 1
+                    yield SSEEvent(data=data, event=event_name, status_code=response.status_code)
+
+                close_reason = "completed"
+
+        except asyncio.CancelledError:
+            close_reason = "client_cancelled"
+            self.log.info(
+                "[%s] upstream.stream.cancelled source=downstream_request action=closing_response elapsed=%.1fms",
+                request_id,
+                (time.perf_counter() - started) * 1000,
+            )
+            raise
+        except GeneratorExit:
+            if close_reason == "unknown":
+                close_reason = "consumer_closed"
+            log_method = self.log.debug if close_reason == "completed" else self.log.info
+            log_method("[%s] upstream.stream.generator_closing reason=%s elapsed=%.1fms", request_id, close_reason, (time.perf_counter() - started) * 1000)
+            raise
+        finally:
+            self.log.info(
+                "[%s] upstream.stream.closed reason=%s status=%s chunks=%s first_chunk=%s elapsed=%.1fms",
+                request_id,
+                close_reason,
+                response_status,
+                chunks,
+                first_chunk,
+                (time.perf_counter() - started) * 1000,
+            )
+
+    async def get_models(self, *, check_permission: bool = True) -> list[dict[str, Any]]:
+        static = self._static_models()
+        if static:
+            self.log.info("[models] static models count=%s", len(static))
+            self.log.debug_json("[models] static models sample", _model_sample(static))
+            return static
+        if not self.BASE_URL:
+            self.log.warning("[models] provider BASE_URL is empty, returning empty model list")
+            return []
+        params = {"checkUserPermission": "true" if check_permission else "false"}
+        url = self._url(self.MODELS_ENDPOINT)
+        self.log.info("[models] upstream request method=GET url=%s", url)
+        response = await self.client.get(url, params=params, headers=self.headers())
+        self.log.info("[models] upstream response status=%s", response.status_code)
+        if response.status_code >= 400:
+            self.log.warning("[models] upstream error status=%s body=%s", response.status_code, response.text[:1000])
+            response.raise_for_status()
+        payload = response.json()
+        return _normalize_models(payload, logger=self.log)
 
     async def aclose(self) -> None:
         await self.client.aclose()
         await self.stream_client.aclose()
 
-    async def get_models(self, *, check_permission: bool = True) -> list[dict[str, Any]]:
-        headers = self.headers()
-        self._log_outgoing_headers("models", None, headers)
-        response = await self.client.get(f"{self.base_url}{self.models_endpoint}", params=self.models_query, headers=headers)
-        response.raise_for_status()
+    def _url(self, endpoint: str) -> str:
+        if not self.BASE_URL:
+            raise RuntimeError("Provider BASE_URL is empty. Create/select a concrete provider with BASE_URL set.")
+        return urljoin(self.BASE_URL.rstrip("/") + "/", endpoint.lstrip("/"))
 
-        data = response.json()
+    def _static_models(self) -> list[dict[str, Any]]:
+        return [{"id": model_id, "object": "model", "created": 0, "owned_by": "upstream"} for model_id in self.STATIC_MODELS]
 
-        if isinstance(data, list):
-            return data
+    def _log_upstream_request(self, request_id: str | None, method: str, url: str, body: dict[str, Any], headers: Mapping[str, str], *, stream: bool = False) -> None:
+        messages = body.get("messages") if isinstance(body.get("messages"), list) else []
+        tools = body.get("tools") if isinstance(body.get("tools"), list) else []
+        self.log.info(
+            "[%s] upstream request method=%s url=%s model=%s stream=%s messages=%s tools=%s header_names=%s",
+            request_id,
+            method,
+            url,
+            body.get("model"),
+            stream or body.get("stream"),
+            len(messages),
+            len(tools),
+            cfg.safe_header_names(headers),
+        )
+        self.log.debug_json(f"[{request_id}] upstream headers", cfg.safe_headers(headers))
+        summary = {
+            "model": body.get("model"),
+            "stream": stream or body.get("stream"),
+            "messages_count": len(messages),
+            "tools_count": len(tools),
+            "max_tokens": body.get("max_tokens"),
+            "temperature": body.get("temperature"),
+            "top_p": body.get("top_p"),
+        }
+        self.log.debug_json(f"[{request_id}] upstream payload_summary", summary)
+        if cfg.DEBUG_STREAM:
+            self.log.debug_json(f"[{request_id}] upstream payload", body)
 
-        if isinstance(data, dict):
-            if isinstance(data.get("data"), list):
-                return data["data"]
 
-            if isinstance(data.get("models"), list):
-                return data["models"]
+def _normalize_models(payload: Any, *, logger=None) -> list[dict[str, Any]]:
+    if logger:
+        logger.debug_json("[models] _normalize_models input", _models_payload_summary(payload))
 
-        return []
+    if isinstance(payload, dict):
+        if isinstance(payload.get("data"), list):
+            source_key = "data"
+            items = payload["data"]
+        elif isinstance(payload.get("models"), list):
+            source_key = "models"
+            items = payload["models"]
+        elif isinstance(payload.get("result"), list):
+            source_key = "result"
+            items = payload["result"]
+        else:
+            source_key = "none"
+            items = []
+    elif isinstance(payload, list):
+        source_key = "list"
+        items = payload
+    else:
+        source_key = "none"
+        items = []
 
-    async def create_completion(self, payload: dict[str, Any], *, request_id: str | None = None) -> dict[str, Any]:
-        body = dict(payload)
-        body["stream"] = False
+    result: list[dict[str, Any]] = []
+    skipped = 0
+    for item in items:
+        if isinstance(item, str):
+            result.append({"id": item, "object": "model", "created": 0, "owned_by": "upstream"})
+        elif isinstance(item, dict):
+            model_id = item.get("id") or item.get("model") or item.get("modelId") or item.get("name")
+            if model_id:
+                normalized = dict(item)
+                normalized.setdefault("id", str(model_id))
+                normalized.setdefault("object", "model")
+                normalized.setdefault("created", 0)
+                normalized.setdefault("owned_by", "upstream")
+                result.append(normalized)
+            else:
+                skipped += 1
+        else:
+            skipped += 1
 
-        headers = self.headers(request_id=request_id)
-        self._log_outgoing_headers("chat", request_id, headers)
-        response = await self.client.post(f"{self.base_url}{self.chat_endpoint}", json=body, headers=headers)
+    if logger:
+        logger.debug_json(
+            "[models] _normalize_models output",
+            {
+                "source_key": source_key,
+                "input_count": len(items),
+                "output_count": len(result),
+                "skipped_count": skipped,
+                "sample": _model_sample(result),
+            },
+        )
+    return result
 
-        if self.debug_stream:
-            self.log.info("[%s] upstream non-stream status=%s http=%s content-type=%s", request_id or "-", response.status_code, response.http_version, response.headers.get("content-type"))
 
-        response.raise_for_status()
-        return response.json()
+def _models_payload_summary(payload: Any) -> dict[str, Any]:
+    if isinstance(payload, dict):
+        summary: dict[str, Any] = {
+            "type": "dict",
+            "keys": sorted(str(key) for key in payload.keys()),
+        }
+        for key in ("data", "models", "result"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                summary[f"{key}_count"] = len(value)
+                summary[f"{key}_sample_type"] = type(value[0]).__name__ if value else None
+        return summary
+    if isinstance(payload, list):
+        return {
+            "type": "list",
+            "count": len(payload),
+            "sample_type": type(payload[0]).__name__ if payload else None,
+        }
+    return {"type": type(payload).__name__, "value_preview": str(payload)[:200]}
 
-    async def stream_sse(self, payload: dict[str, Any], *, request_id: str | None = None) -> AsyncIterator[SSEChunk]:
-        body = dict(payload)
-        body["stream"] = True
 
-        if self.stream_options is not None:
-            body.setdefault("stream_options", self.stream_options)
-
-        headers = self.headers(request_id=request_id, stream=True)
-        self._log_outgoing_headers("stream", request_id, headers)
-
-        async with self.stream_client.stream("POST", f"{self.base_url}{self.chat_endpoint}", json=body, headers=headers) as response:
-            if self.debug_stream:
-                self.log.info("[%s] upstream stream status=%s http=%s content-type=%s encoding=%s", request_id or "-", response.status_code, response.http_version, response.headers.get("content-type"), response.headers.get("content-encoding"))
-
-            if response.status_code >= 400:
-                data = await response.aread()
-                yield SSEChunk(status_code=response.status_code, data=data.decode("utf-8", errors="replace"))
-                return
-
-            async for chunk in SSE.parse(response.status_code, response.aiter_lines()):
-                yield chunk
-
-    def _log_outgoing_headers(self, kind: str, request_id: str | None, headers: dict[str, str]) -> None:
-        self.log.debug("[%s] outgoing provider headers kind=%s headers=%s", request_id or "-", kind, safe_headers(headers))
+def _model_sample(models: list[dict[str, Any]], limit: int = 10) -> list[str]:
+    return [str(item.get("id")) for item in models[:limit] if item.get("id")]

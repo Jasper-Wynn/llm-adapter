@@ -175,7 +175,18 @@ class ToolCallStream:
     states: dict[int, ToolCallState] = field(default_factory=dict)
     meta: dict[int, ToolCallMeta] = field(default_factory=dict)
 
-    def apply(self, delta: list[dict[str, Any]], next_block_index: Callable[[], int]) -> None:
+    def apply(self, delta: list[dict[str, Any]], next_block_index: Callable[[], int] | int) -> None:
+        if not callable(next_block_index):
+            base_index = int(next_block_index)
+            counter = {"value": base_index}
+
+            def next_block_index_fn() -> int:
+                value = counter["value"]
+                counter["value"] += 1
+                return value
+
+            next_block_index = next_block_index_fn
+
         for item in delta:
             if not isinstance(item, dict):
                 continue
